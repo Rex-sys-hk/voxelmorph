@@ -272,8 +272,10 @@ def dice(array1, array2, labels=None, include_zero=False):
 
     dicem = np.zeros(len(labels))
     for idx, label in enumerate(labels):
-        top = 2 * np.sum(np.logical_and(array1 == label, array2 == label))
-        bottom = np.sum(array1 == label) + np.sum(array2 == label)
+        predict_label = np.where(array1 == label, True, False)
+        target_label = np.where(array2 == label, True, False)
+        top = 2 * np.sum(np.logical_and(predict_label, target_label).astype(float))
+        bottom = np.sum(predict_label.astype(float)) + np.sum(target_label.astype(float))
         bottom = np.maximum(bottom, np.finfo(float).eps)  # add epsilon
         dicem[idx] = top / bottom
     return dicem

@@ -40,6 +40,7 @@ if backend == 'pytorch':
     from .torch import layers
     from .torch import networks
     from .torch import losses
+    from .torch import utils
 
 else:
     # tensorflow is default backend

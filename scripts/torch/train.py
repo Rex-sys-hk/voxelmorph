@@ -40,7 +40,8 @@ import argparse
 import time
 import numpy as np
 import torch
-
+from tqdm import tqdm
+from torch.utils.data import DataLoader
 # import voxelmorph with pytorch backend
 os.environ['NEURITE_BACKEND'] = 'pytorch'
 os.environ['VXM_BACKEND'] = 'pytorch'
@@ -53,7 +54,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--img-list', required=True, help='line-seperated list of training files')
 parser.add_argument('--img-prefix', help='optional input image file prefix')
 parser.add_argument('--img-suffix', help='optional input image file suffix')
-parser.add_argument('--atlas', help='atlas filename (default: data/atlas_norm.npz)')
+parser.add_argument('--atlas', help='optional atlas filename')
 parser.add_argument('--model-dir', default='models',
                     help='model output directory (default: models)')
 parser.add_argument('--multichannel', action='store_true',
@@ -66,12 +67,12 @@ parser.add_argument('--epochs', type=int, default=1500,
                     help='number of training epochs (default: 1500)')
 parser.add_argument('--steps-per-epoch', type=int, default=100,
                     help='frequency of model saves (default: 100)')
-parser.add_argument('--load-model', help='optional model file to initialize with')
+parser.add_argument('--load-weights', help='optional weights file to initialize with')
 parser.add_argument('--initial-epoch', type=int, default=0,
                     help='initial epoch number (default: 0)')
 parser.add_argument('--lr', type=float, default=1e-4, help='learning rate (default: 1e-4)')
-parser.add_argument('--cudnn-nondet', action='store_true',
-                    help='disable cudnn determinism - might slow down training')
+# parser.add_argument('--cudnn-nondet', action='store_true',
+#                     help='disable cudnn determinism - might slow down training')
 
 # network architecture parameters
 parser.add_argument('--enc', type=int, nargs='+',
@@ -82,13 +83,18 @@ parser.add_argument('--int-steps', type=int, default=7,
                     help='number of integration steps (default: 7)')
 parser.add_argument('--int-downsize', type=int, default=2,
                     help='flow downsample factor for integration (default: 2)')
+parser.add_argument('--use-probs', action='store_true', help='enable probabilities')
 parser.add_argument('--bidir', action='store_true', help='enable bidirectional cost function')
 
 # loss hyperparameters
 parser.add_argument('--image-loss', default='mse',
                     help='image reconstruction loss - can be mse or ncc (default: mse)')
-parser.add_argument('--lambda', type=float, dest='weight', default=0.01,
-                    help='weight of deformation loss (default: 0.01)')
+parser.add_argument('--lambda', type=float, dest='lambda_weight', default=0.01,
+                    help='weight of gradient or KL loss (default: 0.01)')
+parser.add_argument('--kl-lambda', type=float, default=10,
+                    help='prior lambda regularization for KL loss (default: 10)')
+parser.add_argument('--legacy-image-sigma', dest='image_sigma', type=float, default=1.0,
+                    help='image noise parameter for miccai 2018 network (recommended value is 0.02 when --use-probs is enabled)')  # nopep8
 args = parser.parse_args()
 
 bidir = args.bidir
@@ -106,16 +112,18 @@ if args.atlas:
     atlas = vxm.py.utils.load_volfile(args.atlas, np_var='vol',
                                       add_batch_axis=True, add_feat_axis=add_feat_axis)
     generator = vxm.generators.scan_to_atlas(train_files, atlas,
-                                             batch_size=args.batch_size, bidir=args.bidir,
+                                             batch_size=1, bidir=args.bidir,
                                              add_feat_axis=add_feat_axis)
 else:
     # scan-to-scan generator
     generator = vxm.generators.scan_to_scan(
-        train_files, batch_size=args.batch_size, bidir=args.bidir, add_feat_axis=add_feat_axis)
+        train_files, batch_size=1, bidir=args.bidir, add_feat_axis=add_feat_axis)
 
 # extract shape from sampled input
 inshape = next(generator)[0][0].shape[1:-1]
 
+train_set = vxm.utils.RegData(generator,len(train_files))
+dataloader = DataLoader(train_set, batch_size=args.batch_size, num_workers=24)
 # prepare model folder
 model_dir = args.model_dir
 os.makedirs(model_dir, exist_ok=True)
@@ -129,15 +137,16 @@ assert np.mod(args.batch_size, nb_gpus) == 0, \
     'Batch size (%d) should be a multiple of the nr of gpus (%d)' % (args.batch_size, nb_gpus)
 
 # enabling cudnn determinism appears to speed up training by a lot
-torch.backends.cudnn.deterministic = not args.cudnn_nondet
+# torch.backends.cudnn.deterministic = not args.cudnn_nondet
 
 # unet architecture
 enc_nf = args.enc if args.enc else [16, 32, 32, 32]
 dec_nf = args.dec if args.dec else [32, 32, 32, 32, 32, 16, 16]
 
-if args.load_model:
+if args.load_weights:
     # load initial model (if specified)
-    model = vxm.networks.VxmDense.load(args.load_model, device)
+    model = vxm.networks.VxmDense.load(args.load_weights, device)
+    # model = vxm.networks.VxmComp.load(args.load_weights, device)
 else:
     # otherwise configure new model
     model = vxm.networks.VxmDense(
@@ -178,7 +187,7 @@ else:
 
 # prepare deformation loss
 losses += [vxm.losses.Grad('l2', loss_mult=args.int_downsize).loss]
-weights += [args.weight]
+weights += [args.lambda_weight]
 
 # training loops
 for epoch in range(args.initial_epoch, args.epochs):
@@ -196,28 +205,34 @@ for epoch in range(args.initial_epoch, args.epochs):
         step_start_time = time.time()
 
         # generate inputs (and true outputs) and convert them to tensors
-        inputs, y_true = next(generator)
-        inputs = [torch.from_numpy(d).to(device).float().permute(0, 4, 1, 2, 3) for d in inputs]
-        y_true = [torch.from_numpy(d).to(device).float().permute(0, 4, 1, 2, 3) for d in y_true]
+        for inputs_s, inputs_t, y_true_s ,y_true_t in tqdm(dataloader):
+            inputs_s = inputs_s.to(device).float().permute(0, 3, 1, 2)
+            inputs_t = inputs_t.to(device).float().permute(0, 3, 1, 2)
+            y_true_s = y_true_s.to(device).float().permute(0, 3, 1, 2)
+            y_true_t = y_true_t.to(device).float().permute(0, 3, 1, 2)
 
-        # run inputs through the model to produce a warped image and flow field
-        y_pred = model(*inputs)
+            # run inputs through the model to produce a warped image and flow field
+            y_pred = model(inputs_s, inputs_t)
+            y_true = [y_true_s, y_true_t]
 
-        # calculate total loss
-        loss = 0
-        loss_list = []
-        for n, loss_function in enumerate(losses):
-            curr_loss = loss_function(y_true[n], y_pred[n]) * weights[n]
-            loss_list.append(curr_loss.item())
-            loss += curr_loss
+            # calculate total loss
+            loss = 0
+            loss_list = []
+            for n, loss_function in enumerate(losses):
+                curr_loss = loss_function(y_true[n], y_pred[n]) * weights[n]
+                loss_list.append(curr_loss.item())
+                loss += curr_loss
 
-        epoch_loss.append(loss_list)
-        epoch_total_loss.append(loss.item())
+            # com_loss = model.get_comp_loss()
+            # loss_list.append(com_loss.item())
+            # loss += com_loss
+            epoch_loss.append(loss_list)
+            epoch_total_loss.append(loss.item())
 
-        # backpropagate and optimize
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            # backpropagate and optimize
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
         # get compute time
         epoch_step_time.append(time.time() - step_start_time)
