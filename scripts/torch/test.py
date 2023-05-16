@@ -60,6 +60,8 @@ parser.add_argument('--seg-prefix', help='input seg file prefix')
 parser.add_argument('--labels', help='optional label list to compute dice for (in npy format)')
 parser.add_argument('--multichannel', action='store_true',
                     help='specify that data has multiple channels')
+parser.add_argument('--compative', action='store_true', help='compative mode')
+parser.add_argument('--seg_change_test', action='store_true', help='seg change test')
 args = parser.parse_args()
 
 # sanity check on input pairs
@@ -86,9 +88,13 @@ dice_means = []
 # with tf.device(device):
 with torch.no_grad():
     # load model and build nearest-neighbor transfer model
-    model = vxm.networks.VxmDense.load(args.model, device = device)
+    if not args.compative:
+        model = vxm.networks.VxmDense.load(args.model, device = device)
+    else:
+        model = vxm.networks.VxmComp.load(args.model, device = device)
     model.to(device)
     model.eval()
+    model.transformer.mode = 'nearest'
 
     # moved, warp = model(input_moving, input_fixed, registration=True)
     # registration_model = model.get_registration_model()
@@ -106,15 +112,27 @@ with torch.no_grad():
         fixed_vol = vxm.py.utils.load_volfile(
             img_pairs[i][1], np_var='vol', add_batch_axis=True, add_feat_axis=add_feat_axis)
         fixed_seg = vxm.py.utils.load_volfile(
-            seg_pairs[i][1], np_var='seg')
+            seg_pairs[i][1], np_var='seg', add_batch_axis=True, add_feat_axis=add_feat_axis)
         moving_vol = torch.from_numpy(moving_vol).to(device).float().permute(0, 3, 1, 2)
         moving_seg = torch.from_numpy(moving_seg).to(device).float().permute(0, 3, 1, 2)
         fixed_vol = torch.from_numpy(fixed_vol).to(device).float().permute(0, 3, 1, 2)
+        fixed_seg = torch.from_numpy(fixed_seg).to(device).float().permute(0, 3, 1, 2)
+        if args.seg_change_test:
+            masked_lable_id = torch.randint(1, 24, moving_vol[:,:,0:1,0:1].shape, device=moving_vol.device)
+            if torch.rand([1])<0.5:
+                seg_change = True
+            else:
+                seg_change = False
+            if torch.rand([1])<0.5 and seg_change:
+                moving_vol[moving_seg==masked_lable_id] = 0.
+            elif seg_change:
+                fixed_vol[fixed_seg==masked_lable_id] = 0.
+
         # fixed_seg = [torch.from_numpy(d).to(device).float().unsqueeze(0).permute(0, 3, 1, 2) for d in fixed_seg]
         # fixed_seg = torch.from_numpy(fixed_seg).to(device)
         # predict warp and time
         start = time.time()
-        reg, warp = model(moving_vol, fixed_vol, registration=True)
+        reg, warp = model(moving_vol, fixed_vol, moving_seg, fixed_seg, registration=True)
         reg_time = time.time() - start
         if i != 0:
             # first keras prediction is generally rather slow
@@ -132,14 +150,16 @@ with torch.no_grad():
             plt.imshow(moving_seg.cpu().numpy()[0, 0, :, :], cmap='gray')
             plt.colorbar()
             plt.show()
-            plt.imshow(fixed_seg, cmap='gray')
+            plt.imshow(fixed_seg.cpu().numpy()[0, 0, :, :], cmap='gray')
             plt.colorbar()
             plt.show()
             plt.imshow(warped_seg.cpu().round().numpy(), cmap='gray')
             plt.colorbar()
             plt.show()
         # compute volume overlap (dice)
-        overlap = vxm.py.utils.dice(warped_seg.cpu().round().numpy(), fixed_seg, labels=labels)
+        overlap = vxm.py.utils.dice(warped_seg.cpu().round().numpy(), 
+                                    fixed_seg.cpu().numpy()[0, 0, :, :], 
+                                    labels=labels)
         dice_means.append(np.mean(overlap))
         print('Pair %d    Reg Time: %.4f    Dice: %.4f +/- %.4f' % (i + 1, reg_time,
                                                                     np.mean(overlap),

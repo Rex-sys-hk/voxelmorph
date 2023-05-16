@@ -42,6 +42,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
 # import voxelmorph with pytorch backend
 os.environ['NEURITE_BACKEND'] = 'pytorch'
 os.environ['VXM_BACKEND'] = 'pytorch'
@@ -95,13 +96,16 @@ parser.add_argument('--kl-lambda', type=float, default=10,
                     help='prior lambda regularization for KL loss (default: 10)')
 parser.add_argument('--legacy-image-sigma', dest='image_sigma', type=float, default=1.0,
                     help='image noise parameter for miccai 2018 network (recommended value is 0.02 when --use-probs is enabled)')  # nopep8
+parser.add_argument('--compative', action='store_true', help='enable compative loss', default=False)
 args = parser.parse_args()
 
 bidir = args.bidir
 
 # load and prepare training data
-train_files = vxm.py.utils.read_file_list(args.img_list, prefix=args.img_prefix,
-                                          suffix=args.img_suffix)
+train_files = vxm.py.utils.read_pair_list(args.img_list, prefix=args.img_prefix, 
+                                            suffix=args.img_suffix)
+if not args.compative:
+    train_files = [tf[0] for tf in train_files]
 assert len(train_files) > 0, 'Could not find any training data.'
 
 # no need to append an extra feature axis if data is multichannel
@@ -120,9 +124,13 @@ else:
         train_files, batch_size=1, bidir=args.bidir, add_feat_axis=add_feat_axis)
 
 # extract shape from sampled input
-inshape = next(generator)[0][0].shape[1:-1]
-
-train_set = vxm.utils.RegData(generator,len(train_files))
+if args.compative:
+    inshape = vxm.py.utils.load_volfile(train_files[0][0], np_var='vol',
+                                      add_batch_axis=False, add_feat_axis=False).shape
+    train_set = vxm.utils.CompData(train_files)
+else:
+    inshape = next(generator)[0][0].shape[1:-1]
+    train_set = vxm.utils.RegData(generator,len(train_files))
 dataloader = DataLoader(train_set, batch_size=args.batch_size, num_workers=24)
 # prepare model folder
 model_dir = args.model_dir
@@ -145,17 +153,28 @@ dec_nf = args.dec if args.dec else [32, 32, 32, 32, 32, 16, 16]
 
 if args.load_weights:
     # load initial model (if specified)
-    model = vxm.networks.VxmDense.load(args.load_weights, device)
-    # model = vxm.networks.VxmComp.load(args.load_weights, device)
+    if args.compative:
+        model = vxm.networks.VxmComp.load(args.load_weights, device)
+    else:
+        model = vxm.networks.VxmDense.load(args.load_weights, device)
 else:
     # otherwise configure new model
-    model = vxm.networks.VxmDense(
-        inshape=inshape,
-        nb_unet_features=[enc_nf, dec_nf],
-        bidir=bidir,
-        int_steps=args.int_steps,
-        int_downsize=args.int_downsize
-    )
+    if args.compative:
+        model = vxm.networks.VxmComp(
+            inshape=inshape,
+            nb_unet_features=[enc_nf, dec_nf],
+            bidir=bidir,
+            int_steps=args.int_steps,
+            int_downsize=args.int_downsize
+        )
+    else:
+        model = vxm.networks.VxmDense(
+            inshape=inshape,
+            nb_unet_features=[enc_nf, dec_nf],
+            bidir=bidir,
+            int_steps=args.int_steps,
+            int_downsize=args.int_downsize
+        )
 
 if nb_gpus > 1:
     # use multiple GPUs via DataParallel
@@ -188,13 +207,14 @@ else:
 # prepare deformation loss
 losses += [vxm.losses.Grad('l2', loss_mult=args.int_downsize).loss]
 weights += [args.lambda_weight]
-
+init_loss = 1e5
 # training loops
 for epoch in range(args.initial_epoch, args.epochs):
 
     # save model checkpoint
     if epoch % 20 == 0:
         model.save(os.path.join(model_dir, '%04d.pt' % epoch))
+        model.save(os.path.join(model_dir, 'new.pt'))
 
     epoch_loss = []
     epoch_total_loss = []
@@ -206,15 +226,20 @@ for epoch in range(args.initial_epoch, args.epochs):
 
         # generate inputs (and true outputs) and convert them to tensors
         for inputs_s, inputs_t, y_true_s ,y_true_t in tqdm(dataloader):
-            inputs_s = inputs_s.to(device).float().permute(0, 3, 1, 2)
-            inputs_t = inputs_t.to(device).float().permute(0, 3, 1, 2)
-            y_true_s = y_true_s.to(device).float().permute(0, 3, 1, 2)
-            y_true_t = y_true_t.to(device).float().permute(0, 3, 1, 2)
+            inputs_s = inputs_s.to(device).float()
+            inputs_t = inputs_t.to(device).float()
+            y_true_s = y_true_s.to(device).float()
+            y_true_t = y_true_t.to(device).float()
 
             # run inputs through the model to produce a warped image and flow field
-            y_pred = model(inputs_s, inputs_t)
-            y_true = [y_true_s, y_true_t]
-
+            y_pred = model(inputs_s, inputs_t, y_true_s, y_true_t)
+            y_true = [y_pred[2], inputs_t]
+            # plt.imshow(inputs_s[0,0].cpu().numpy())
+            # plt.show()
+            # plt.imshow(inputs_t[0,0].cpu().numpy())
+            # plt.show()
+            # plt.imshow(y_pred[0][0,0].cpu().detach().numpy())
+            # plt.show()
             # calculate total loss
             loss = 0
             loss_list = []
@@ -222,10 +247,10 @@ for epoch in range(args.initial_epoch, args.epochs):
                 curr_loss = loss_function(y_true[n], y_pred[n]) * weights[n]
                 loss_list.append(curr_loss.item())
                 loss += curr_loss
-
-            # com_loss = model.get_comp_loss()
-            # loss_list.append(com_loss.item())
-            # loss += com_loss
+            if args.compative:
+                com_loss = model.get_comp_loss()
+                loss_list.append(com_loss.item())
+                loss += com_loss
             epoch_loss.append(loss_list)
             epoch_total_loss.append(loss.item())
 
@@ -243,6 +268,10 @@ for epoch in range(args.initial_epoch, args.epochs):
     losses_info = ', '.join(['%.4e' % f for f in np.mean(epoch_loss, axis=0)])
     loss_info = 'loss: %.4e  (%s)' % (np.mean(epoch_total_loss), losses_info)
     print(' - '.join((epoch_info, time_info, loss_info)), flush=True)
+    if np.mean(epoch_loss, axis=0)[0]<init_loss:
+        init_loss = np.mean(epoch_loss, axis=0)[0]
+        print(f'new best in epoch {epoch}')
+        model.save(os.path.join(model_dir, 'best.pt'))
 
 # final model save
 model.save(os.path.join(model_dir, '%04d.pt' % args.epochs))

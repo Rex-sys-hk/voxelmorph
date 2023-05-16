@@ -1,4 +1,5 @@
 import numpy as np
+from sympy import Q
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -239,10 +240,11 @@ class VxmDense(LoadableModel):
         self.integrate = layers.VecInt(down_shape, int_steps) if int_steps > 0 else None
 
         # configure transformer 
-        # TODO: enabel mode configuration
-        self.transformer = layers.SpatialTransformer(inshape, mode='nearest')
+        # mode have to be bilinear when training
+        # mode have to be nearest when testing
+        self.transformer = layers.SpatialTransformer(inshape)
 
-    def forward(self, source, target, registration=False):
+    def forward(self, source, target, *args, registration=False):
         '''
         Parameters:
             source: Source image tensor.
@@ -278,12 +280,16 @@ class VxmDense(LoadableModel):
                 neg_flow = self.fullsize(neg_flow) if self.bidir else None
 
         # warp image with flow field
+        if self.training:
+            self.transformer.mode = 'bilinear'
+        else:
+            self.transformer.mode = 'nearest'
         y_source = self.transformer(source, pos_flow)
         y_target = self.transformer(target, neg_flow) if self.bidir else None
 
         # return non-integrated flow field if training
         if not registration:
-            return (y_source, y_target, preint_flow) if self.bidir else (y_source, preint_flow)
+            return (y_source, y_target, preint_flow) if self.bidir else (y_source, preint_flow, target)
         else:
             return y_source, pos_flow
 
@@ -343,7 +349,7 @@ class EncoderDecoder(Unet):
                 x = conv(x)
             if not self.half_res or level < (self.nb_levels - 2):
                 x = self.upsampling[level](x)
-                x = torch.cat([x, self.x_history.pop()[:x.shape[0]]], dim=1)
+                x = torch.cat([x, self.x_history.pop()], dim=1)
 
         # remaining convs at full resolution
         for conv in self.remaining:
@@ -395,6 +401,7 @@ class VxmComp(LoadableModel):
         super().__init__()
 
         # internal flag indicating whether to return flow or integrated warp during inference
+        print('Loading VxmComp model--Pytorch version')
         self.training = True
 
         # ensure correct dimensionality
@@ -402,16 +409,6 @@ class VxmComp(LoadableModel):
         assert ndims in [1, 2, 3], 'ndims should be one of 1, 2, or 3. found: %d' % ndims
         # configure core unet model
         self.unet_model = EncoderDecoder(
-            inshape,
-            infeats=(src_feats + trg_feats),
-            # infeats=src_feats,
-            nb_features=nb_unet_features,
-            nb_levels=nb_unet_levels,
-            feat_mult=unet_feat_mult,
-            nb_conv_per_level=nb_unet_conv_per_level,
-            half_res=unet_half_res,
-        )
-        self.unet_model_res = EncoderDecoder(
             inshape,
             infeats=(src_feats + trg_feats),
             # infeats=src_feats,
@@ -456,7 +453,7 @@ class VxmComp(LoadableModel):
         # configure transformer
         self.transformer = layers.SpatialTransformer(inshape)
 
-    def forward(self, source, target, registration=False):
+    def forward(self, source, target, source_label, target_label, registration=False):
         '''
         Parameters:
             source: Source image tensor.
@@ -466,14 +463,32 @@ class VxmComp(LoadableModel):
 
         # concatenate inputs and propagate unet
         btsz = source.shape[0]
-        inputs = torch.cat([source, target], dim=0)
-        inputs = inputs.repeat(1,2,1,1)
-        x_same = self.unet_model.encoding(inputs)
-        x_diff = self.unet_model_res.encoding(inputs)
-        self.comp_loss = torch.norm(x_same[:btsz]-x_same[btsz:],dim=[-1,-2])**2 + (10-torch.norm(x_diff[:btsz]-x_diff[btsz:],dim=[-1,-2])**2).clamp(min=0)
-        self.comp_loss = self.comp_loss.mean()
-        x = (x_same[btsz:])+(x_diff[:btsz]-x_diff[btsz:])
+        inputs = torch.cat([source, target], dim=1)
+        x = self.unet_model.encoding(inputs)
+        if self.training:
+            x_orig = x
+            masked_lable_id = torch.randint(1, 24, source[:,:,0:1,0:1].shape, device=source.device)
+            if torch.rand([1])<0.5:
+                seg_change = True if self.training else False
+            else:
+                seg_change = False
+            if torch.rand([1])<0.5 and seg_change:
+                source[source_label==masked_lable_id] = 0.
+            elif seg_change:
+                target[target_label==masked_lable_id] = 0.
+            inputs = torch.cat([source, target], dim=1)
+            x_diff = self.unet_model.encoding(inputs)
+            x_orig_n = torch.nn.functional.normalize(x_orig,dim=[-3])
+            x_diff_n = torch.nn.functional.normalize(x_diff,dim=[-3])
+            sim_loss = (torch.norm(x_orig_n-x_diff_n,dim=[-3])**2).clamp(min=0).mean()
+            # if self.l_x is not None:
+            diff_loss = (1-torch.norm(x_orig_n-x_diff_n,dim=[-3])**2).clamp(min=0).mean()
+            # else:
+            #     diff_loss = 0.
+            self.comp_loss = sim_loss if seg_change else diff_loss
+            x = x_orig if not seg_change else x_diff
         x = self.unet_model.decoding(x)
+        # self.l_x = x_orig_n.detach()
         # transform into flow field
         flow_field = self.flow(x)
 
@@ -498,12 +513,16 @@ class VxmComp(LoadableModel):
                 neg_flow = self.fullsize(neg_flow) if self.bidir else None
 
         # warp image with flow field
+        if self.training:
+            self.transformer.mode = 'bilinear'
+        else:
+            self.transformer.mode = 'nearest'
         y_source = self.transformer(source, pos_flow)
         y_target = self.transformer(target, neg_flow) if self.bidir else None
 
         # return non-integrated flow field if training
         if not registration:
-            return (y_source, y_target, preint_flow) if self.bidir else (y_source, preint_flow)
+            return (y_source, y_target, preint_flow) if self.bidir else (y_source, preint_flow, target)
         else:
             return y_source, pos_flow
 
