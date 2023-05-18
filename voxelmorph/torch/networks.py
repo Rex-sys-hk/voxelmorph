@@ -5,9 +5,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
+from voxelmorph.py.utils import dice
+
 from .. import default_unet_features
 from . import layers
 from .modelio import LoadableModel, store_config_args
+import matplotlib.pyplot as plt
 
 
 class Unet(nn.Module):
@@ -452,6 +455,9 @@ class VxmComp(LoadableModel):
 
         # configure transformer
         self.transformer = layers.SpatialTransformer(inshape)
+        self.cos = nn.CosineSimilarity(dim=-1, eps=1e-6)
+        self.augmentation_mode = 'focus_trans' #'fuzzy_comp', 'seg_wise','focus_trans'
+        # self.mlp = nn.Sequential(nn.Linear(32,32),nn.ReLU(),nn.Dropout(0.1),nn.Linear(32,32))
 
     def forward(self, source, target, source_label, target_label, registration=False):
         '''
@@ -460,13 +466,75 @@ class VxmComp(LoadableModel):
             target: Target image tensor.
             registration: Return transformed image and flow. Default is False.
         '''
-
         # concatenate inputs and propagate unet
         btsz = source.shape[0]
-        inputs = torch.cat([source, target], dim=1)
-        x = self.unet_model.encoding(inputs)
-        if self.training:
-            x_orig = x
+        ## SS seperate segmentation
+        if self.augmentation_mode=='seg_wise' and self.training and torch.rand(1) > 0.5:
+            source1 = source.clone()
+            source2 = source.clone()
+            target1 = target.clone()
+            target2 = target.clone()
+            label_1 = torch.randint(1,24,(btsz,1,1,1)).to(source.device)
+            s_label = torch.where(source_label == label_1, True, False)
+            t_label = torch.where(target_label == label_1, True, False)
+            source1[~s_label] = 0
+            target1[~t_label] = 0
+            label_2 = torch.randint(1,24,(btsz,1,1,1)).to(source.device)
+            s_label = torch.where(source_label == label_2, True, False)
+            t_label = torch.where(target_label == label_2, True, False)
+            source2[~s_label] = 0
+            target2[~t_label] = 0
+            inputs1 = torch.cat([source1, target1], dim=1)
+            inputs2 = torch.cat([source2, target2], dim=1)
+            # inputs = torch.cat([source, target], dim=1)
+            inputs = torch.cat([inputs1,inputs2],dim=0)
+            x = self.unet_model.encoding(inputs)
+            x1 = x[:btsz]
+            x2 = x[btsz:]
+            target = torch.cat([target1,target2],dim=0)
+            # if label_1 == label_2:
+            #     self.comp_loss = torch.norm(self.mlp(x1.permute(0,2,3,1))**2-self.mlp(x2.permute(0,2,3,1))**2,dim=[-1]).mean()
+            # else:
+            #     self.comp_loss = -torch.norm(self.mlp(x1.permute(0,2,3,1))**2-self.mlp(x2.permute(0,2,3,1))**2,dim=[-1]).mean().clamp(max=20)
+            if label_1 == label_2:
+                self.comp_loss = torch.norm(x1-x2,dim=[-1]).mean()
+            else:
+                self.comp_loss = -torch.norm(x1-x2,dim=[-1]).mean().clamp(max=10)
+
+        ## Fuzzy Contrastive
+        elif self.training and btsz==2 and self.augmentation_mode == 'fuzzy_comp':
+            inputs = torch.cat([source, target], dim=1)
+            x = self.unet_model.encoding(inputs)
+            overlap_s = torch.zeros_like(source_label[...,0:1,0].repeat(1,1,24))
+            bottoms = torch.zeros_like(source_label[...,0:1,0].repeat(1,1,24))
+            # overlap_t = torch.zeros_like(source_label[...,0:1,0].repeat(1,1,24))
+            s_size = torch.where(source_label == 0, False, True).sum(dim=[-1,-2])
+            t_size = torch.where(target_label == 0, False, True).sum(dim=[-1,-2])
+
+            for idx, label in enumerate(range(1,24)):
+                s_label = torch.where(source_label == label, True, False)
+                t_label = torch.where(target_label == label, True, False)
+
+                top = 2 * torch.sum(torch.logical_and(s_label, t_label),dim=[-1,-2])
+                bottom = torch.sum(s_label,dim=[-1,-2]) + torch.sum(t_label,dim=[-1,-2])
+                diff = torch.sum(t_label,dim=[-1,-2])-torch.sum(s_label,dim=[-1,-2])
+                # bottom = np.maximum(bottom, np.finfo(float).eps)  # add epsilon
+                # dicem[idx] = top / bottom
+                bottoms[:,:,idx] = bottom
+                overlap_s[:,:,idx] = top/bottom
+                overlap_s = overlap_s.nan_to_num(nan=0.0)
+                # overlap_t[:,idx] = torch.sum(overlap.astype(float),dim=[-1,-2,-3])/torch.sum(t_label.astype(float),dim=[-1,-2,-3])-0.5
+            # overlap_s = overlap_s-overlap_s.mean(dim=-1, keepdim=True)
+
+            # min_bot, min_bot_id = bottoms.topk(k=5,dim=-1,largest=False)
+            # overlap_s = overlap_s.gather(dim=-1,index=min_bot_id)
+            sim_score = self.cos(overlap_s[0], overlap_s[1])
+            self.comp_loss = (sim_score*torch.norm(x[0]-x[1],dim=[-3])).mean().clamp(min=-10)
+        ## FT
+        elif self.training and btsz==2 and self.augmentation_mode == 'focus_trans':
+            inputs = torch.cat([source, target], dim=1)
+            x = self.unet_model.encoding(inputs)
+            x_orig = x.clone()
             masked_lable_id = torch.randint(1, 24, source[:,:,0:1,0:1].shape, device=source.device)
             if torch.rand([1])<0.5:
                 seg_change = True if self.training else False
@@ -481,12 +549,13 @@ class VxmComp(LoadableModel):
             x_orig_n = torch.nn.functional.normalize(x_orig,dim=[-3])
             x_diff_n = torch.nn.functional.normalize(x_diff,dim=[-3])
             sim_loss = (torch.norm(x_orig_n-x_diff_n,dim=[-3])**2).clamp(min=0).mean()
-            # if self.l_x is not None:
             diff_loss = (1-torch.norm(x_orig_n-x_diff_n,dim=[-3])**2).clamp(min=0).mean()
-            # else:
-            #     diff_loss = 0.
             self.comp_loss = sim_loss if seg_change else diff_loss
-            x = x_orig if not seg_change else x_diff
+        else:
+            inputs = torch.cat([source, target], dim=1)
+            x = self.unet_model.encoding(inputs)
+            self.comp_loss = torch.zeros([1]).to(source.device).mean(0)
+
         x = self.unet_model.decoding(x)
         # self.l_x = x_orig_n.detach()
         # transform into flow field
@@ -517,8 +586,8 @@ class VxmComp(LoadableModel):
             self.transformer.mode = 'bilinear'
         else:
             self.transformer.mode = 'nearest'
-        y_source = self.transformer(source, pos_flow)
-        y_target = self.transformer(target, neg_flow) if self.bidir else None
+        y_source = self.transformer(inputs[:,:btsz], pos_flow)
+        y_target = self.transformer(inputs[btsz:,1:], neg_flow) if self.bidir else None
 
         # return non-integrated flow field if training
         if not registration:
