@@ -1,4 +1,9 @@
-# voxelmorph: Learning-Based Image Registration  
+Project of a course. Added competitive learning in voxelmorph.
+With few improvements...
+
+# Original README
+
+# voxelmorph: Learning-Based Image Registration
 
 **voxelmorph** is a general purpose library for learning-based tools for alignment/registration, and more generally modelling with deformations.
 
